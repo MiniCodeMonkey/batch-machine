@@ -555,7 +555,7 @@ def ogr_source_to_csv(source_config, source_path, dest_path, disable_centroids):
             if geom is not None:
                 geom.Transform(coordTransform)
 
-                if source_config.layer == "addresses" and !disable_centroids:
+                if source_config.layer == "addresses" and not disable_centroids:
                     # For Addresses - Calculate the centroid on surface of the geometry and write it as X and Y columns
                     try:
                         centroid = geom.PointOnSurface()
@@ -685,7 +685,7 @@ def geojson_source_to_csv(source_config, source_path, dest_path, disable_centroi
                     if not geom:
                         continue
 
-                    if source_config.layer == "addresses" and !disable_centroids:
+                    if source_config.layer == "addresses" and not disable_centroids:
                         # For Addresses - Calculate the centroid on surface of the geometry and write it as X and Y columns
                         geom = geom.PointOnSurface()
 
@@ -783,7 +783,7 @@ def row_extract_and_reproject(source_config, source_row, disable_centroids):
                 _L.debug("Could not reproject %s %s in SRS %s", source_x, source_y, srs)
 
     # For Addresses - Calculate the centroid on surface of the geometry and write it as X and Y columns
-    if source_config.layer == "addresses" and !disable_centroids:
+    if source_config.layer == "addresses" and not disable_centroids:
         geom = ogr.CreateGeometryFromWkt(source_geom)
 
         try:
