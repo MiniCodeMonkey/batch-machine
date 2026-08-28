@@ -12,6 +12,9 @@ import unittest
 import tempfile
 import shutil
 
+from unittest import mock
+from zipfile import ZipFile
+
 from .. import SourceConfig
 
 from ..conform import (
@@ -25,7 +28,8 @@ from ..conform import (
     row_fxn_first_non_empty, row_fxn_constant, row_fxn_map,
     row_canonicalize_unit_and_number, conform_cli,
     convert_regexp_replace, normalize_ogr_filename_case,
-    is_in, geojson_source_to_csv, check_source_tests
+    is_in, geojson_source_to_csv, ogr_source_to_csv, check_source_tests,
+    ZipDecompressTask, DecompressionError, elaborate_filenames
     )
 
 " Return an x,y array given a wkt point string"
@@ -336,6 +340,37 @@ class TestConformTransforms (unittest.TestCase):
                             "function": "regexp",
                             "field": "ADDRESS",
                             "pattern": "(fake)"
+                        }
+                    }
+                }]
+            }
+        }), "addresses", "default")
+        d = { "ADDRESS": "123 MAPLE ST" }
+        e = copy.deepcopy(d)
+        e.update({ "oa:number": "123", "oa:street": "" })
+
+        d = row_fxn_regexp(c, d, "number", c.data_source["conform"]["number"])
+        d = row_fxn_regexp(c, d, "street", c.data_source["conform"]["street"])
+        self.assertEqual(e, d)
+
+        "regex split - replace - bad match"
+        c = SourceConfig(dict({
+            "schema": 2,
+            "layers": {
+                "addresses": [{
+                    "name": "default",
+                    "conform": {
+                        "number": {
+                            "function": "regexp",
+                            "field": "ADDRESS",
+                            "pattern": "^([0-9]+)(?:.*)",
+                            "replace": "$1"
+                        },
+                        "street": {
+                            "function": "regexp",
+                            "field": "ADDRESS",
+                            "pattern": "(fake)",
+                            "replace": "$1"
                         }
                     }
                 }]
@@ -1849,6 +1884,36 @@ class TestConformCli (unittest.TestCase):
             self.assertEqual(rows[5]['properties']['number'], '5115')
             self.assertEqual(rows[5]['properties']['street'], 'OLD MILL RD')
 
+    def test_lake_man_kml(self):
+        with open(os.path.join(self.conforms_dir, "lake-man-kml.json")) as file:
+            source_config = SourceConfig(json.load(file), "addresses", "default")
+        source_path = os.path.join(self.conforms_dir, "lake-man.kml")
+        dest_path = os.path.join(self.testdir, 'lake-man-kml-conformed.csv')
+
+        rc = conform_cli(source_config, source_path, dest_path)
+        self.assertEqual(0, rc)
+
+        with open(dest_path) as fp:
+            rows = list(map(json.loads, list(fp)))
+
+            self.assertEqual('Point', rows[0]['geometry']['type'])
+            self.assertAlmostEqual(-122.2592497, rows[0]['geometry']['coordinates'][0], places=4)
+            self.assertAlmostEqual(37.8026126, rows[0]['geometry']['coordinates'][1], places=4)
+
+            self.assertEqual(6, len(rows))
+            self.assertEqual(rows[0]['properties']['number'], '5115')
+            self.assertEqual(rows[0]['properties']['street'], 'FRUITED PLAINS LN')
+            self.assertEqual(rows[1]['properties']['number'], '5121')
+            self.assertEqual(rows[1]['properties']['street'], 'FRUITED PLAINS LN')
+            self.assertEqual(rows[2]['properties']['number'], '5133')
+            self.assertEqual(rows[2]['properties']['street'], 'FRUITED PLAINS LN')
+            self.assertEqual(rows[3]['properties']['number'], '5126')
+            self.assertEqual(rows[3]['properties']['street'], 'FRUITED PLAINS LN')
+            self.assertEqual(rows[4]['properties']['number'], '5120')
+            self.assertEqual(rows[4]['properties']['street'], 'FRUITED PLAINS LN')
+            self.assertEqual(rows[5]['properties']['number'], '5115')
+            self.assertEqual(rows[5]['properties']['street'], 'OLD MILL RD')
+
     def test_lake_man_split(self):
         rc, dest_path = self._run_conform_on_source('lake-man-split', 'shp')
         self.assertEqual(0, rc)
@@ -1937,6 +2002,24 @@ class TestConformCli (unittest.TestCase):
             self.assertAlmostEqual(-122.2592497, rows[0]['geometry']['coordinates'][0], places=4)
             self.assertAlmostEqual(37.8026126, rows[0]['geometry']['coordinates'][1], places=4)
 
+    def test_lake_man_shp_epsg4269_axis_order(self):
+        # Regression test for https://github.com/openaddresses/batch-machine/issues/26
+        # A shapefile with an explicit geographic "srs" tag (here EPSG:4269, NAD83)
+        # must not have its coordinates flipped by GDAL 3's authority-compliant
+        # (lat, lon) axis order. The underlying shapefile geometry is stored in
+        # ordinary (lon, lat) order, same coordinates as the plain lake-man.shp
+        # fixture used by test_lake_man, so the expected output here matches that
+        # test's expected values. Before the fix, this source's coordinates come
+        # out as (lat, lon) instead of (lon, lat).
+        rc, dest_path = self._run_conform_on_source('lake-man-epsg4269', 'shp')
+        self.assertEqual(0, rc)
+
+        with open(dest_path) as fp:
+            rows = list(map(json.loads, list(fp)))
+            self.assertEqual('Point', rows[0]['geometry']['type'])
+            self.assertAlmostEqual(-122.2592497, rows[0]['geometry']['coordinates'][0], places=4)
+            self.assertAlmostEqual(37.8026126, rows[0]['geometry']['coordinates'][1], places=4)
+
     # TODO: add tests for non-ESRI GeoJSON sources
 
     def test_lake_man_split2(self):
@@ -2016,8 +2099,11 @@ class TestConformCli (unittest.TestCase):
         with open(dest_path) as fp:
             rows = list(map(json.loads, list(fp)))
             self.assertEqual(6, len(rows))
-            self.assertAlmostEqual(37.8026126, rows[0]['geometry']['coordinates'][0], places=4)
-            self.assertAlmostEqual(-122.2592497, rows[0]['geometry']['coordinates'][1], places=4)
+            # GeoJSON coordinates are always [lon, lat]. This source has an
+            # explicit "srs": "EPSG:4326" tag; see
+            # https://github.com/openaddresses/batch-machine/issues/26.
+            self.assertAlmostEqual(-122.2592497, rows[0]['geometry']['coordinates'][0], places=4)
+            self.assertAlmostEqual(37.8026126, rows[0]['geometry']['coordinates'][1], places=4)
             self.assertEqual(rows[0]['properties']['number'], '5115')
             self.assertEqual(rows[0]['properties']['street'], 'FRUITED PLAINS LN')
 
@@ -2254,6 +2340,107 @@ class TestConformMisc(unittest.TestCase):
             row = next(csv.DictReader(file))
             self.assertEqual(row[GEOM_FIELDNAME], 'POINT (-74.9833483425103 40.05498715)')
             self.assertEqual(row['PARCEL_NUM'], '02-022-003')
+
+    def test_geojson_source_to_csv_non_uniform_properties(self):
+        ''' Features with different property keys should not crash the writer.
+        '''
+        c = SourceConfig(dict({
+            "schema": 2,
+            "layers": {
+                "addresses": [{
+                    "name": "default",
+                    "conform": { }
+                }]
+            }
+        }), "addresses", "default")
+
+        geojson_path = os.path.join(self.testdir, 'non-uniform.geojson')
+        with open(geojson_path, 'w', encoding='utf8') as file:
+            json.dump({
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {"pid": "1"},
+                        "geometry": {"type": "Point", "coordinates": [-121.2, 39.3]}
+                    },
+                    {
+                        "type": "Feature",
+                        "properties": {"pid": "2", "address": "123 Maple St"},
+                        "geometry": {"type": "Point", "coordinates": [-121.3, 39.4]}
+                    }
+                ]
+            }, file)
+
+        csv_path = os.path.join(self.testdir, 'non-uniform-conformed.csv')
+        geojson_source_to_csv(c, geojson_path, csv_path)
+
+        with open(csv_path, encoding='utf8') as file:
+            rows = list(csv.DictReader(file))
+            self.assertEqual(rows[0]['pid'], '1')
+            self.assertEqual(rows[0]['address'], '')
+            self.assertEqual(rows[1]['pid'], '2')
+            self.assertEqual(rows[1]['address'], '123 Maple St')
+
+    def test_ogr_source_to_csv_multisurface(self):
+        ''' Curve geometries (e.g. MULTISURFACE) from file geodatabases should
+        be linearized before being written out, since shapely/GEOS can't
+        parse GDAL's curve-geometry WKT types.
+        https://github.com/openaddresses/batch-machine/issues/62
+        '''
+        from osgeo import ogr, osr
+        from shapely.wkt import loads as wkt_loads
+
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(4326)
+
+        source_path = os.path.join(self.testdir, 'curved-buildings.gpkg')
+        driver = ogr.GetDriverByName('GPKG')
+        datasource = driver.CreateDataSource(source_path)
+        layer = datasource.CreateLayer('buildings', srs=srs, geom_type=ogr.wkbMultiSurface)
+        layer.CreateField(ogr.FieldDefn('bin', ogr.OFTString))
+
+        feature = ogr.Feature(layer.GetLayerDefn())
+        feature.SetField('bin', '12345')
+        feature.SetGeometry(ogr.CreateGeometryFromWkt(
+            'MULTISURFACE (CURVEPOLYGON (CIRCULARSTRING (0 0, 1 1, 2 0, 1 -1, 0 0)))'
+        ))
+        layer.CreateFeature(feature)
+        feature = None
+        datasource = None
+
+        c = SourceConfig(dict({
+            "schema": 2,
+            "layers": {
+                "buildings": [{
+                    "name": "default",
+                    "conform": {"format": "gpkg"}
+                }]
+            }
+        }), "buildings", "default")
+
+        csv_path = os.path.join(self.testdir, 'curved-buildings.csv')
+        ogr_source_to_csv(c, source_path, csv_path)
+
+        with open(csv_path, encoding='utf8') as file:
+            row = next(csv.DictReader(file))
+            self.assertEqual(row['bin'], '12345')
+
+            # The output WKT should be a linear geometry type that shapely can parse.
+            self.assertNotIn('CURVE', row[GEOM_FIELDNAME])
+            self.assertNotIn('SURFACE', row[GEOM_FIELDNAME])
+
+            geom = wkt_loads(row[GEOM_FIELDNAME])
+            self.assertEqual(geom.geom_type, 'MultiPolygon')
+
+            # Sanity-check the linearized shape isn't degenerate and roughly
+            # matches the original curve geometry's bounds.
+            minx, miny, maxx, maxy = geom.bounds
+            self.assertAlmostEqual(minx, 0, places=2)
+            self.assertAlmostEqual(maxx, 2, places=2)
+            self.assertAlmostEqual(miny, -1, places=2)
+            self.assertAlmostEqual(maxy, 1, places=2)
+            self.assertGreater(geom.area, 0)
 
 class TestConformCsv(unittest.TestCase):
     "Fixture to create real files to test csv_source_to_csv()"
@@ -2540,3 +2727,171 @@ class TestAccuracyMap(unittest.TestCase):
 
         d = row_fxn_map(c, d, "accuracy", c.data_source["conform"]["accuracy"])
         self.assertEqual(e, d)
+
+
+class TestZipDecompressTask(unittest.TestCase):
+    ''' Regression tests for GitHub issue #35: "Support zipped shapefiles
+        within source zip" -- an outer source zip contains a nested zip that
+        itself contains the shapefile, plus miscellaneous extra files
+        (license, readme, lookup tables) sitting next to the nested zip.
+    '''
+
+    def setUp(self):
+        self.testdir = tempfile.mkdtemp(prefix='openaddr-TestZipDecompressTask-')
+        self.workdir = os.path.join(self.testdir, 'work')
+        os.mkdir(self.workdir)
+
+        # A real shapefile (.shp/.shx/.dbf/.prj) fixture, already zipped up.
+        self.inner_zip_path = os.path.join(
+            os.path.dirname(__file__), 'conforms', 'lake-man.zip')
+
+    def tearDown(self):
+        shutil.rmtree(self.testdir)
+
+    def _make_outer_zip(self, extra_files={'license.txt': 'be nice', 'readme.txt': 'read me'}):
+        ''' Build an outer.zip containing nested.zip (the shapefile zip)
+            alongside some unrelated non-zip files, matching the structure
+            described in issue #35.
+        '''
+        outer_zip_path = os.path.join(self.testdir, 'outer.zip')
+
+        with ZipFile(outer_zip_path, 'w') as outer_zip:
+            outer_zip.write(self.inner_zip_path, arcname='nested.zip')
+            for name, content in extra_files.items():
+                outer_zip.writestr(name, content)
+
+        return outer_zip_path
+
+    def test_single_nested_zip_is_extracted(self):
+        ''' A zip-of-a-zip-containing-a-shapefile, with no "file" filter
+            (i.e. no conform "file" tag), should be fully extracted so the
+            shapefile members end up available.
+        '''
+        outer_zip_path = self._make_outer_zip()
+
+        task = ZipDecompressTask()
+        output_files = task.decompress([outer_zip_path], self.workdir, [])
+
+        output_names = {os.path.basename(path) for path in output_files}
+        self.assertIn('lake-man.shp', output_names)
+        self.assertIn('lake-man.shx', output_names)
+        self.assertIn('lake-man.dbf', output_names)
+        self.assertIn('lake-man.prj', output_names)
+
+        # The extra sibling files should also have survived extraction.
+        self.assertIn('license.txt', output_names)
+        self.assertIn('readme.txt', output_names)
+
+        shp_path = next(path for path in output_files if path.endswith('lake-man.shp'))
+        self.assertGreater(os.path.getsize(shp_path), 0)
+
+    def test_single_nested_zip_is_extracted_with_file_filter(self):
+        ''' Same structure as above, but exercised the way a real source
+            would use it: with a conform "file" tag naming the shapefile
+            inside the nested zip (e.g. "file": "lake-man.shp"), which is
+            expanded by elaborate_filenames() into the .shp/.shx/.dbf/.prj
+            set and passed through as the `filenames` allow-list.
+        '''
+        outer_zip_path = self._make_outer_zip()
+        filenames = elaborate_filenames('lake-man.shp')
+
+        task = ZipDecompressTask()
+        output_files = task.decompress([outer_zip_path], self.workdir, filenames)
+
+        output_names = {os.path.basename(path) for path in output_files}
+        self.assertIn('lake-man.shp', output_names)
+        self.assertIn('lake-man.shx', output_names)
+        self.assertIn('lake-man.dbf', output_names)
+        self.assertIn('lake-man.prj', output_names)
+
+        # Sibling non-zip files that don't match the filter should still be
+        # skipped, since the caller only asked for the named shapefile.
+        self.assertNotIn('license.txt', output_names)
+        self.assertNotIn('readme.txt', output_names)
+
+    def test_multiple_nested_zips_raise_decompression_error(self):
+        ''' If more than one zip appears at the same directory level inside
+            the outer zip, extraction should fail loudly rather than
+            silently pick one.
+        '''
+        outer_zip_path = os.path.join(self.testdir, 'outer-ambiguous.zip')
+
+        with ZipFile(outer_zip_path, 'w') as outer_zip:
+            outer_zip.write(self.inner_zip_path, arcname='nested-a.zip')
+            outer_zip.write(self.inner_zip_path, arcname='nested-b.zip')
+
+        task = ZipDecompressTask()
+        with self.assertRaises(DecompressionError):
+            task.decompress([outer_zip_path], self.workdir, [])
+
+    def test_skips_nested_zip_once_filtered_file_is_already_found(self):
+        ''' If the outer zip already directly contains everything the
+            "file" filter asked for, an unrelated nested zip sitting next
+            to it should never be opened/extracted at all - there's no
+            reason to recurse once the request is satisfied, and not doing
+            so limits exposure to a zip bomb hiding in that nested zip.
+        '''
+        outer_zip_path = os.path.join(self.testdir, 'outer-already-satisfied.zip')
+        conforms_dir = os.path.join(os.path.dirname(__file__), 'conforms')
+
+        with ZipFile(outer_zip_path, 'w') as outer_zip:
+            for ext in ('.shp', '.shx', '.dbf', '.prj'):
+                outer_zip.write(
+                    os.path.join(conforms_dir, 'lake-man' + ext),
+                    arcname='lake-man' + ext
+                )
+            # An unrelated nested zip that should never get opened.
+            with tempfile.NamedTemporaryFile(suffix='.zip') as decoy_zip_file:
+                with ZipFile(decoy_zip_file.name, 'w') as decoy_zip:
+                    decoy_zip.writestr('decoy.txt', 'should never be extracted')
+                outer_zip.write(decoy_zip_file.name, arcname='decoy.zip')
+
+        filenames = elaborate_filenames('lake-man.shp')
+
+        task = ZipDecompressTask()
+        output_files = task.decompress([outer_zip_path], self.workdir, filenames)
+
+        output_names = {os.path.basename(path) for path in output_files}
+        self.assertIn('lake-man.shp', output_names)
+        self.assertIn('lake-man.shx', output_names)
+        self.assertIn('lake-man.dbf', output_names)
+        self.assertIn('lake-man.prj', output_names)
+
+        # Proves decoy.zip was never opened/extracted: neither its contents
+        # nor the zip file itself should appear anywhere in the output.
+        self.assertNotIn('decoy.txt', output_names)
+        self.assertNotIn('decoy.zip', output_names)
+
+    def test_oversized_entry_raises_decompression_error(self):
+        ''' A zip entry declaring an uncompressed size over the configured
+            cap should be refused before extraction, as a zip bomb guard.
+            Uses a real (small) fixture but lowers the cap far below its
+            actual size, rather than crafting an actual multi-GB payload.
+        '''
+        outer_zip_path = self._make_outer_zip()
+
+        task = ZipDecompressTask()
+        with mock.patch.object(ZipDecompressTask, 'MAX_ZIP_ENTRY_BYTES', 10):
+            with self.assertRaises(DecompressionError):
+                task.decompress([outer_zip_path], self.workdir, [])
+
+    def test_deeply_nested_zips_raise_decompression_error(self):
+        ''' A chain of nested zips deeper than the configured limit should
+            be refused, as a zip bomb guard against chained amplification.
+            Each level's nested zip is placed inside its own subfolder
+            (arcname "levelN/nested.zip") so unwrapping one level doesn't
+            land in the same directory as the next - matching how the
+            existing "one zip per directory" width check expects real
+            nested archives to be laid out.
+        '''
+        current_path = self.inner_zip_path
+        for level in range(4):
+            next_path = os.path.join(self.testdir, 'wrap-{}.zip'.format(level))
+            with ZipFile(next_path, 'w') as z:
+                z.write(current_path, arcname='level{}/nested.zip'.format(level))
+            current_path = next_path
+
+        task = ZipDecompressTask()
+        with mock.patch.object(ZipDecompressTask, 'MAX_NESTED_ZIP_DEPTH', 2):
+            with self.assertRaises(DecompressionError):
+                task.decompress([current_path], self.workdir, [])

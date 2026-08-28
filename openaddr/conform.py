@@ -203,26 +203,56 @@ def is_in(path, names):
     return False
 
 class ZipDecompressTask(DecompressionTask):
+    # Recursing into nested zips (see #35/#112) means a maliciously or
+    # accidentally crafted zip bomb could otherwise fill a job's disk before
+    # any per-entry file type filtering applies. Cap the declared
+    # (uncompressed) size of any single entry and how many nested zips deep
+    # we'll recurse, so worst case is bounded and the job fails loudly
+    # instead of exhausting disk.
+    MAX_ZIP_ENTRY_BYTES = 2 * 1024 ** 3  # 2GB
+    MAX_NESTED_ZIP_DEPTH = 10
+
     def decompress(self, source_paths, workdir, filenames):
         output_files = []
         expand_path = os.path.join(workdir, UNZIPPED_DIRNAME)
         mkdirsp(expand_path)
 
         # Extract contents of zip file into expand_path directory.
+        found = set()
         for source_path in source_paths:
-            self._extract_zip(source_path, expand_path, filenames)
+            found |= self._extract_zip(source_path, expand_path, filenames)
+
+        def fully_satisfied():
+            # Only short-circuit when there's an explicit file filter AND
+            # we can prove every name it asked for has actually been
+            # extracted - if filenames is empty (caller wants everything)
+            # or matching is inexact (e.g. a directory-style entry in
+            # `filenames` that `is_in()` matched but doesn't literally
+            # equal), this stays False and we fall back to full recursion,
+            # same as before this optimization existed.
+            return bool(filenames) and set(filenames) <= found
 
         # Recursively extract nested zip files, but fail if more than one zip
-        # appears at the same directory level.
+        # appears at the same directory level. Skip recursing at all once the
+        # requested file(s) are already found - there's no reason to keep
+        # opening nested zips we don't need, which also limits exposure to a
+        # zip bomb hiding deeper in the chain than what was asked for.
         processed = set()
-        pending = list(self._find_single_zips(expand_path))
+        pending = [] if fully_satisfied() else list(self._find_single_zips(expand_path))
 
         while pending:
+            if len(processed) >= self.MAX_NESTED_ZIP_DEPTH:
+                raise DecompressionError(
+                    "Refusing to recurse more than {} nested zip files deep - possible zip bomb"
+                    .format(self.MAX_NESTED_ZIP_DEPTH)
+                )
             zip_path = pending.pop()
             if zip_path in processed:
                 continue
             processed.add(zip_path)
-            self._extract_zip(zip_path, os.path.dirname(zip_path), filenames)
+            found |= self._extract_zip(zip_path, os.path.dirname(zip_path), filenames)
+            if fully_satisfied():
+                break
             pending.extend(self._find_single_zips(os.path.dirname(zip_path)))
 
         # Collect names of directories and files in expand_path directory.
@@ -232,20 +262,54 @@ class ZipDecompressTask(DecompressionTask):
                     output_files.append(os.path.join(dirpath, dirname))
                     _L.debug("Expanded directory {}".format(output_files[-1]))
             for filename in filenames:
+                if filename.lower().endswith('.zip'):
+                    # A zip left un-recursed-into (e.g. because the request
+                    # was already satisfied without it, or filtered out at
+                    # its own directory level) isn't a usable source file.
+                    continue
                 output_files.append(os.path.join(dirpath, filename))
                 _L.debug("Expanded file {}".format(output_files[-1]))
 
         return output_files
 
     def _extract_zip(self, source_path, expand_path, filenames):
+        ''' Extract matching entries, returning the subset of `filenames`
+            (lower-cased) that were found by exact name - used by
+            decompress() to tell whether it's safe to stop recursing into
+            further nested zips.
+        '''
+        found = set()
         with ZipFile(source_path, 'r') as z:
-            for name in z.namelist():
+            for zinfo in z.infolist():
+                name = zinfo.filename
+
+                # Check the declared (uncompressed) size from the zip's
+                # central directory before extracting anything - a bomb's
+                # compressed size can be tiny, but its declared size isn't.
+                if zinfo.file_size > self.MAX_ZIP_ENTRY_BYTES:
+                    raise DecompressionError(
+                        "Refusing to extract {} - declared size {} bytes exceeds {} byte limit, possible zip bomb"
+                        .format(name, zinfo.file_size, self.MAX_ZIP_ENTRY_BYTES)
+                    )
+
+                # Nested zip files are always extracted regardless of the
+                # filenames filter, since the requested file may be inside
+                # one of them. The filter is re-applied when that nested
+                # zip is itself extracted.
+                if name.lower().endswith('.zip'):
+                    z.extract(zinfo, expand_path)
+                    continue
+
                 if len(filenames) and not is_in(name, filenames):
                     # Download only the named file, if any.
                     _L.debug("Skipped file {}".format(name))
                     continue
 
+                if len(filenames) and name.lower() in filenames:
+                    found.add(name.lower())
+
                 z.extract(name, expand_path)
+        return found
 
     def _find_single_zips(self, root_path):
         zip_paths = []
@@ -427,6 +491,28 @@ def find_source_path(data_source, source_paths):
                     return c
             _L.warning("Source names file %s but could not find it", source_file_name)
             return None
+    elif format_string == "kml":
+        candidates = []
+        for fn in source_paths:
+            basename, ext = os.path.splitext(fn)
+            if ext.lower() == ".kml":
+                candidates.append(fn)
+        if len(candidates) == 0:
+            _L.warning("No KML found in %s", source_paths)
+            return None
+        elif len(candidates) == 1:
+            _L.debug("Selected %s for source", candidates[0])
+            return candidates[0]
+        else:
+            if "file" not in conform:
+                _L.warning("Multiple KML files found, but source has no file attribute.")
+                return None
+            source_file_name = conform["file"]
+            for c in candidates:
+                if source_file_name == os.path.basename(c):
+                    return c
+            _L.warning("Source names file %s but could not find it", source_file_name)
+            return None
     elif format_string == "xml":
         # Return file if it's specified, else return the first .gml file we find
         if "file" in conform:
@@ -550,6 +636,10 @@ def ogr_source_to_csv(source_config, source_path, dest_path, disable_centroids=F
             _L.debug("SRS tag found specifying %s", srs)
             inSpatialRef = osr.SpatialReference()
             inSpatialRef.ImportFromEPSG(int(srs[5:]))
+
+            if int(osgeo.__version__[0]) >= 3:
+                # GDAL 3 changes axis order: https://github.com/OSGeo/gdal/issues/1546
+                inSpatialRef.SetAxisMappingStrategy(osgeo.osr.OAMS_TRADITIONAL_GIS_ORDER)
         else:
             # OGR is capable of doing more than EPSG, but so far we don't need it.
             raise Exception("Bad SRS. Can only handle EPSG, the SRS tag is %s", srs)
@@ -605,6 +695,14 @@ def ogr_source_to_csv(source_config, source_path, dest_path, disable_centroids=F
             geom = in_feature.GetGeometryRef()
             if geom is not None:
                 geom.Transform(coordTransform)
+
+                if geom.HasCurveGeometry():
+                    # Some sources (notably file geodatabases with curved
+                    # parcel/building boundaries) contain curve geometry types
+                    # like MULTISURFACE or CURVEPOLYGON. Shapely/GEOS can't
+                    # parse those WKT types, so linearize them first.
+                    # https://github.com/openaddresses/batch-machine/issues/62
+                    geom = geom.GetLinearGeometry()
 
                 if source_config.layer == "addresses" and not disable_centroids:
                     # For Addresses - Calculate the centroid on surface of the geometry and write it as X and Y columns
@@ -716,18 +814,26 @@ def csv_source_to_csv(source_config, source_path, dest_path, disable_centroids=F
 def geojson_source_to_csv(source_config, source_path, dest_path, disable_centroids=False):
     '''
     '''
+    # Not every feature shares the same set of properties, so make a first
+    # pass to collect the union of every feature's property keys (in
+    # first-seen order) before opening the CSV writer.
+    out_fieldnames = []
+    seen_fieldnames = set()
+    with open(source_path) as file:
+        for feature in stream_geojson(file):
+            for key in feature['properties'].keys():
+                if key not in seen_fieldnames:
+                    seen_fieldnames.add(key)
+                    out_fieldnames.append(key)
+    out_fieldnames.append(GEOM_FIELDNAME)
+
     # For every row in the source GeoJSON
     with open(source_path) as file:
         # Write the extracted CSV file
         with open(dest_path, 'w', encoding='utf-8') as dest_fp:
-            writer = None
+            writer = csv.DictWriter(dest_fp, out_fieldnames)
+            writer.writeheader()
             for (row_number, feature) in enumerate(stream_geojson(file)):
-                if writer is None:
-                    out_fieldnames = list(feature['properties'].keys())
-                    out_fieldnames.append(GEOM_FIELDNAME)
-                    writer = csv.DictWriter(dest_fp, out_fieldnames)
-                    writer.writeheader()
-
                 try:
                     row = feature['properties']
                     if feature['geometry'] is None:
@@ -943,8 +1049,8 @@ def row_fxn_regexp(sc, row, key, fxn):
     pattern = re.compile(fxn.get("pattern", False))
     replace = fxn.get('replace', False)
     if replace:
-        match = re.sub(pattern, convert_regexp_replace(replace), row[fxn["field"]])
-        row["oa:{}".format(key)] = match
+        value = row[fxn["field"]]
+        row["oa:{}".format(key)] = re.sub(pattern, convert_regexp_replace(replace), value) if pattern.search(value) else ''
     else:
         match = pattern.search(row[fxn["field"]])
         row["oa:{}".format(key)] = ''.join(filter(None, match.groups())) if match else ''
@@ -1190,7 +1296,7 @@ def extract_to_source_csv(source_config, source_path, extract_path, disable_cent
     format_string = source_config.data_source["conform"]['format']
     protocol_string = source_config.data_source['protocol']
 
-    if format_string in ("shapefile", "xml", "gdb", "gpkg"):
+    if format_string in ("shapefile", "xml", "gdb", "gpkg", "kml"):
         ogr_source_path = normalize_ogr_filename_case(source_path)
         ogr_source_to_csv(source_config, ogr_source_path, extract_path, disable_centroids)
     elif format_string == "csv":
@@ -1233,7 +1339,7 @@ def conform_cli(source_config, source_path, dest_path, disable_centroids=False):
 
     format_string = source_config.data_source["conform"].get('format')
 
-    if not format_string in ["shapefile", "geojson", "csv", "xml", "gdb", "gpkg"]:
+    if not format_string in ["shapefile", "geojson", "csv", "xml", "gdb", "gpkg", "kml"]:
         _L.warning("Skipping file with unknown conform: %s", source_path)
         return 1
 
