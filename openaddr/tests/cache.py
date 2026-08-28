@@ -100,6 +100,21 @@ class TestCacheEsriDownload (unittest.TestCase):
             if request.method == 'POST' and body_qs.get('resultOffset') == ['0']:
                 local_path = join(data_dirname, 'us-al-cullman-0.json')
 
+        if (host, path) == ('bcmaps.bradfordco.org', '/arcgis/rest/services/Address_Points/MapServer/0'):
+            qs = parse_qs(query)
+
+            if qs.get('f') == ['json']:
+                local_path = join(data_dirname, 'us-pa-bradford-metadata.json')
+
+        if (host, path) == ('bcmaps.bradfordco.org', '/arcgis/rest/services/Address_Points/MapServer/0/query'):
+            qs = parse_qs(query)
+            body_qs = parse_qs(request.body)
+
+            if qs.get('returnCountOnly') == ['true']:
+                local_path = join(data_dirname, 'us-pa-bradford-count-only.json')
+            if request.method == 'POST' and body_qs.get('resultOffset') == ['0']:
+                local_path = join(data_dirname, 'us-pa-bradford-0.json')
+
         if local_path:
             type, _ = mimetypes.guess_type(local_path)
             with open(local_path, 'rb') as file:
@@ -399,6 +414,32 @@ class TestCacheEsriDownload (unittest.TestCase):
                 self.assertEqual(len(all_data),  5)
                 self.assertTrue('oa:geom' in all_data[0])
                 self.assertEqual(all_data[0]['oa:geom'], 'POINT (-86.82960553 34.18671398)')
+
+    def test_skip_esri_features_with_nan_geometry(self):
+        """ ESRI Caching Will Skip Features Whose Geometry Is The String "NaN" """
+        task = EsriRestDownloadTask('us-pa-bradford')
+        c = SourceConfig(dict({
+            "schema": 2,
+            "layers": {
+                "addresses": [{
+                    "name": "default",
+                    "conform": {
+                        "number": "Add_Number",
+                        "street": "FullAddr"
+                    }
+                }]
+            }
+        }), "addresses", "default")
+
+        with httmock.HTTMock(self.response_content):
+            output_path = task.download(["https://bcmaps.bradfordco.org/arcgis/rest/services/Address_Points/MapServer/0"], self.workdir, c)
+
+            with open(output_path[0], 'r') as file:
+                all_data = list(csv.DictReader(file))
+
+        self.assertEqual(len(all_data), 2)
+        self.assertEqual([row['FullAddr'] for row in all_data], ['148 DESMOND ST APT 202', '150 DESMOND ST'])
+        self.assertNotIn('nan', ' '.join(row['oa:geom'] for row in all_data).lower())
 
 class TestFromProtocolStringHeaders (unittest.TestCase):
 

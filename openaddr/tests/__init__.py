@@ -1072,10 +1072,16 @@ class TestOA (unittest.TestCase):
         output_path = join(dirname(state_path), state["processed"])
 
         with open(output_path, encoding='utf8') as input:
-            rows = list(map(json.loads, list(input)))
+            contents = input.read()
+            self.assertNotIn('NaN', contents)
+
+            rows = list(map(json.loads, contents.splitlines()))
+
+            # One of the nine cached features has a NaN geometry and is skipped
+            self.assertEqual(len(rows), 8)
             self.assertEqual(rows[0]['properties']['id'], u'')
             self.assertEqual(rows[0]['properties']['number'], u'434')
-            self.assertEqual(rows[0]['properties']['hash'], u'8a72112f6b1404d8')
+            self.assertEqual(rows[0]['properties']['hash'], u'a0127261b0619522')
             self.assertEqual(rows[0]['properties']['city'], u'MONROE')
             self.assertEqual(rows[0]['geometry']['coordinates'], [-74.1926686, 41.3187728])
             self.assertEqual(rows[0]['properties']['street'], u'')

@@ -47,6 +47,13 @@ def traverse(item):
     else:
         yield item
 
+def coordinate_is_usable(value):
+    "Test a single coordinate for a finite number; ESRI reports null geometry as the string \"NaN\""
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
 def request(method, url, **kwargs):
     if urlparse(url).scheme == 'ftp':
         if method != 'GET':
@@ -440,8 +447,8 @@ class EsriRestDownloadTask(DownloadTask):
 
                         if not geom:
                             raise TypeError("No geometry parsed")
-                        if any((isinstance(g, float) and math.isnan(g)) for g in traverse(geom)):
-                            raise TypeError("Geometry has NaN coordinates")
+                        if any(not coordinate_is_usable(c) for c in traverse(geom.get('coordinates'))):
+                            raise TypeError("Geometry has non-finite coordinates")
 
                         shp = shape(geom)
                         row[GEOM_FIELDNAME] = shp.wkt
