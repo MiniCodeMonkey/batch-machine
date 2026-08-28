@@ -46,6 +46,10 @@ gdal.PushErrorHandler(gdal_error_handler)
 # We add columns to the extracted CSV with our own data with these names.
 GEOM_FIELDNAME = 'oa:geom'
 
+# WKT coordinates that json.dumps would write as NaN or Infinity, which no strict
+# GeoJSON parser will accept. ESRI services report a null point geometry this way.
+NONFINITE_COORDINATE_PATTERN = re.compile(r'\b(nan|inf(inity)?)\b', re.IGNORECASE)
+
 ADDRESSES_SCHEMA = [ 'hash', 'number', 'street', 'unit', 'building_name', 'city', 'district', 'region', 'postcode', 'id', 'accuracy' ]
 BUILDINGS_SCHEMA = [ 'hash', 'height', 'levels']
 PARCELS_SCHEMA = [ 'hash', 'pid' ]
@@ -897,7 +901,7 @@ def row_extract_and_reproject(source_config, source_row, disable_centroids=False
     if source_row.get(GEOM_FIELDNAME.replace('GEOM', 'geom')) is not None:
         del out_row[GEOM_FIELDNAME.replace('GEOM', 'geom')]
 
-    if source_geom == "POINT (nan nan)":
+    if source_geom is not None and NONFINITE_COORDINATE_PATTERN.search(source_geom):
         out_row[GEOM_FIELDNAME] = None
         return out_row
 
@@ -1251,7 +1255,7 @@ def row_convert_to_out(source_config, row):
     "Convert a row from the source schema to OpenAddresses output schema"
 
     geom = row.get(GEOM_FIELDNAME, None)
-    if geom == "POINT EMPTY" or geom == '':
+    if geom == "POINT EMPTY" or geom == '' or (geom is not None and NONFINITE_COORDINATE_PATTERN.search(geom)):
         geom = None
 
     output = {
@@ -1328,7 +1332,7 @@ def transform_to_out_geojson(source_config, extract_path, dest_path):
             # For every row in the extract
             for extract_row in reader:
                 out_row = row_transform_and_convert(source_config, extract_row)
-                dest_fp.write(json.dumps(out_row) + '\n')
+                dest_fp.write(json.dumps(out_row, allow_nan=False) + '\n')
 
 def conform_cli(source_config, source_path, dest_path, disable_centroids=False):
     "Command line entry point for conforming a downloaded source to an output CSV."

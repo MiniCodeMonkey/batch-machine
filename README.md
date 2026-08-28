@@ -77,3 +77,9 @@ diverge from upstream and must be preserved across upstream merges:
   conformed output row, so named-but-unnumbered properties stay individually
   addressable. It is a geocodio-specific addition and is not part of the
   upstream OpenAddresses schema.
+- **Non-finite geometry is never written out** — ESRI services report a null
+  point geometry as the string `"NaN"`, which reached the output as
+  `"coordinates": [NaN, NaN]`. Invalid GeoJSON per RFC 7946, and unparseable by
+  strict decoders. `openaddr/cache.py` now skips those features on download and
+  `openaddr/conform.py` treats any non-finite WKT coordinate as no geometry,
+  with `allow_nan=False` on the output writer as a backstop.

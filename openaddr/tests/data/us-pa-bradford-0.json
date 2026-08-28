@@ -1,0 +1,63 @@
+{
+ "objectIdFieldName": "OBJECTID",
+ "globalIdFieldName": "",
+ "geometryType": "esriGeometryPoint",
+ "spatialReference": {
+  "wkid": 4326,
+  "latestWkid": 4326
+ },
+ "fields": [
+  {
+   "name": "OBJECTID",
+   "alias": "OBJECTID",
+   "type": "esriFieldTypeOID"
+  },
+  {
+   "name": "Add_Number",
+   "alias": "Add_Number",
+   "type": "esriFieldTypeInteger"
+  },
+  {
+   "name": "FullAddr",
+   "alias": "FullAddr",
+   "type": "esriFieldTypeString",
+   "length": 254
+  }
+ ],
+ "features": [
+  {
+   "attributes": {
+    "OBJECTID": 18,
+    "Add_Number": 148,
+    "FullAddr": "148 DESMOND ST APT 206"
+   },
+   "geometry": {
+    "x": "NaN",
+    "y": "NaN"
+   }
+  },
+  {
+   "attributes": {
+    "OBJECTID": 33828,
+    "Add_Number": 148,
+    "FullAddr": "148 DESMOND ST APT 202"
+   },
+   "geometry": {
+    "x": -76.51535,
+    "y": 41.97911
+   }
+  },
+  {
+   "attributes": {
+    "OBJECTID": 33840,
+    "Add_Number": 150,
+    "FullAddr": "150 DESMOND ST"
+   },
+   "geometry": {
+    "x": -76.51522,
+    "y": 41.97925
+   }
+  }
+ ],
+ "exceededTransferLimit": false
+}

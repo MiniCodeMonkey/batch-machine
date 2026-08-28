@@ -1,0 +1,47 @@
+{
+ "currentVersion": 10.51,
+ "id": 0,
+ "name": "Addresses",
+ "type": "Feature Layer",
+ "geometryType": "esriGeometryPoint",
+ "objectIdField": "OBJECTID",
+ "displayField": "FullAddr",
+ "advancedQueryCapabilities": {
+  "supportsPagination": true,
+  "supportsStatistics": true,
+  "supportsOrderBy": true,
+  "supportsDistinct": true
+ },
+ "supportsStatistics": true,
+ "supportsAdvancedQueries": true,
+ "extent": {
+  "xmin": -76.6,
+  "ymin": 41.6,
+  "xmax": -76.2,
+  "ymax": 41.9,
+  "spatialReference": {
+   "wkid": 4326,
+   "latestWkid": 4326
+  }
+ },
+ "fields": [
+  {
+   "name": "OBJECTID",
+   "alias": "OBJECTID",
+   "type": "esriFieldTypeOID"
+  },
+  {
+   "name": "Add_Number",
+   "alias": "Add_Number",
+   "type": "esriFieldTypeInteger"
+  },
+  {
+   "name": "FullAddr",
+   "alias": "FullAddr",
+   "type": "esriFieldTypeString",
+   "length": 254
+  }
+ ],
+ "capabilities": "Map,Query,Data",
+ "maxRecordCount": 1000
+}

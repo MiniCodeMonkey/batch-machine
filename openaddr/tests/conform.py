@@ -26,7 +26,7 @@ from ..conform import (
     row_fxn_postfixed_unit,
     row_fxn_remove_prefix, row_fxn_remove_postfix, row_fxn_chain,
     row_fxn_first_non_empty, row_fxn_constant, row_fxn_map,
-    row_canonicalize_unit_and_number, conform_cli,
+    row_canonicalize_unit_and_number, conform_cli, transform_to_out_geojson,
     convert_regexp_replace, normalize_ogr_filename_case,
     is_in, geojson_source_to_csv, ogr_source_to_csv, check_source_tests,
     ZipDecompressTask, DecompressionError, elaborate_filenames
@@ -77,6 +77,59 @@ class TestConformTransforms (unittest.TestCase):
                 "coordinates": (-119.2, 39.3)
             }
         }, r)
+
+    def test_row_convert_to_out_nonfinite_geometry(self):
+        "ESRI sources report a null point geometry as NaN, which isn't valid GeoJSON"
+        d = SourceConfig(dict({
+            "schema": 2,
+            "layers": {
+                "addresses": [{
+                    "name": "default",
+                    "conform": { "street": "s", "number": "n" }
+                }]
+            }
+        }), "addresses", "default")
+
+        for wkt in ("POINT (NaN NaN)", "POINT (nan nan)", "POINT Z (nan nan nan)"):
+            r = row_convert_to_out(d, {"s": "DESMOND ST", "n": "148", GEOM_FIELDNAME: wkt})
+            self.assertIsNone(r["geometry"], wkt)
+
+    def test_transform_to_out_geojson_skips_nonfinite_geometry(self):
+        "A NaN coordinate must never reach the output GeoJSON"
+        d = SourceConfig(dict({
+            "schema": 2,
+            "layers": {
+                "addresses": [{
+                    "name": "default",
+                    "conform": { "street": "s", "number": "n" }
+                }]
+            }
+        }), "addresses", "default")
+
+        workdir = tempfile.mkdtemp(prefix='testConform-')
+        try:
+            extract_path = os.path.join(workdir, 'extract.csv')
+            dest_path = os.path.join(workdir, 'out.geojson')
+
+            with open(extract_path, 'w', encoding='utf-8') as file:
+                writer = csv.DictWriter(file, fieldnames=['s', 'n', GEOM_FIELDNAME])
+                writer.writeheader()
+                writer.writerow({'s': 'DESMOND ST', 'n': '148', GEOM_FIELDNAME: 'POINT (NaN NaN)'})
+                writer.writerow({'s': 'DESMOND ST', 'n': '150', GEOM_FIELDNAME: 'POINT (-76.51522 41.97925)'})
+
+            transform_to_out_geojson(d, extract_path, dest_path)
+
+            with open(dest_path, 'r', encoding='utf-8') as file:
+                contents = file.read()
+
+            self.assertNotIn('NaN', contents)
+            rows = [json.loads(line) for line in contents.splitlines()]
+        finally:
+            shutil.rmtree(workdir)
+
+        self.assertEqual(len(rows), 2)
+        self.assertIsNone(rows[0]['geometry'])
+        self.assertEqual(rows[1]['geometry'], {'type': 'Point', 'coordinates': [-76.51522, 41.97925]})
 
     def test_row_merge(self):
         d = SourceConfig(dict({
