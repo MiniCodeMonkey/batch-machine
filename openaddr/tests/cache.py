@@ -3,6 +3,7 @@ from __future__ import absolute_import, division, print_function
 import csv
 
 from .. import SourceConfig
+from .. import cache as cache_fn
 from urllib.parse import urlparse, parse_qs
 from os.path import join, dirname
 
@@ -16,7 +17,13 @@ import unittest
 import httmock
 import tempfile
 
-from ..cache import guess_url_file_extension, EsriRestDownloadTask
+import sys
+from ..cache import guess_url_file_extension, EsriRestDownloadTask, URLDownloadTask, DownloadTask
+
+# openaddr/__init__.py defines a `cache` function that shadows the `cache`
+# submodule on the `openaddr` package object, so `from .. import cache`
+# would grab the function, not the module. Go through sys.modules instead.
+cache_module = sys.modules['openaddr.cache']
 
 class TestCacheExtensionGuessing (unittest.TestCase):
 
@@ -92,6 +99,21 @@ class TestCacheEsriDownload (unittest.TestCase):
                 local_path = join(data_dirname, 'us-al-cullman-count-only.json')
             if request.method == 'POST' and body_qs.get('resultOffset') == ['0']:
                 local_path = join(data_dirname, 'us-al-cullman-0.json')
+
+        if (host, path) == ('bcmaps.bradfordco.org', '/arcgis/rest/services/Address_Points/MapServer/0'):
+            qs = parse_qs(query)
+
+            if qs.get('f') == ['json']:
+                local_path = join(data_dirname, 'us-pa-bradford-metadata.json')
+
+        if (host, path) == ('bcmaps.bradfordco.org', '/arcgis/rest/services/Address_Points/MapServer/0/query'):
+            qs = parse_qs(query)
+            body_qs = parse_qs(request.body)
+
+            if qs.get('returnCountOnly') == ['true']:
+                local_path = join(data_dirname, 'us-pa-bradford-count-only.json')
+            if request.method == 'POST' and body_qs.get('resultOffset') == ['0']:
+                local_path = join(data_dirname, 'us-pa-bradford-0.json')
 
         if local_path:
             type, _ = mimetypes.guess_type(local_path)
@@ -392,3 +414,172 @@ class TestCacheEsriDownload (unittest.TestCase):
                 self.assertEqual(len(all_data),  5)
                 self.assertTrue('oa:geom' in all_data[0])
                 self.assertEqual(all_data[0]['oa:geom'], 'POINT (-86.82960553 34.18671398)')
+
+    def test_skip_esri_features_with_nan_geometry(self):
+        """ ESRI Caching Will Skip Features Whose Geometry Is The String "NaN" """
+        task = EsriRestDownloadTask('us-pa-bradford')
+        c = SourceConfig(dict({
+            "schema": 2,
+            "layers": {
+                "addresses": [{
+                    "name": "default",
+                    "conform": {
+                        "number": "Add_Number",
+                        "street": "FullAddr"
+                    }
+                }]
+            }
+        }), "addresses", "default")
+
+        with httmock.HTTMock(self.response_content):
+            output_path = task.download(["https://bcmaps.bradfordco.org/arcgis/rest/services/Address_Points/MapServer/0"], self.workdir, c)
+
+            with open(output_path[0], 'r') as file:
+                all_data = list(csv.DictReader(file))
+
+        self.assertEqual(len(all_data), 2)
+        self.assertEqual([row['FullAddr'] for row in all_data], ['148 DESMOND ST APT 202', '150 DESMOND ST'])
+        self.assertNotIn('nan', ' '.join(row['oa:geom'] for row in all_data).lower())
+
+class TestFromProtocolStringHeaders (unittest.TestCase):
+
+    def test_headers_reach_url_download_task(self):
+        task = DownloadTask.from_protocol_string('http', 'us-il-champaign', headers={'Referer': 'https://example.gov/'})
+        self.assertIsInstance(task, URLDownloadTask)
+        self.assertEqual(task.headers['Referer'], 'https://example.gov/')
+        # The default User-Agent is still present alongside custom headers.
+        self.assertIn('User-Agent', task.headers)
+
+    def test_headers_reach_esri_download_task(self):
+        task = DownloadTask.from_protocol_string('ESRI', 'us-il-champaign', headers={'Referer': 'https://example.gov/'})
+        self.assertIsInstance(task, EsriRestDownloadTask)
+        self.assertEqual(task.headers['Referer'], 'https://example.gov/')
+
+    def test_headers_reach_esri_dumper(self):
+        ''' EsriRestDownloadTask.download() must pass its headers to
+            EsriDumper as extra_headers, since pyesridump makes its own
+            requests independent of openaddr.cache.request().
+        '''
+        workdir = tempfile.mkdtemp(prefix='testCacheHeaders-')
+        try:
+            task = EsriRestDownloadTask('us-fl-palmbeach', headers={'Referer': 'https://example.gov/'})
+            c = SourceConfig(dict({
+                "schema": 2,
+                "layers": {
+                    "addresses": [{
+                        "name": "default",
+                        "conform": None
+                    }]
+                }
+            }), "addresses", "default")
+
+            with patch.object(cache_module, 'EsriDumper') as dumper_patch:
+                dumper_patch.return_value.get_metadata.return_value = {'fields': []}
+                dumper_patch.return_value.get_feature_count.return_value = 0
+                dumper_patch.return_value.__iter__.return_value = iter([])
+
+                task.download(['http://example.com/'], workdir, c)
+
+                _, kwargs = dumper_patch.call_args
+                self.assertEqual(kwargs.get('extra_headers'), task.headers)
+                self.assertEqual(kwargs['extra_headers']['Referer'], 'https://example.gov/')
+        finally:
+            shutil.rmtree(workdir)
+
+    def test_no_headers_still_gets_default_user_agent(self):
+        task = DownloadTask.from_protocol_string('http', 'us-il-champaign')
+        self.assertEqual(list(task.headers.keys()), ['User-Agent'])
+
+    def test_custom_user_agent_overrides_default(self):
+        task = DownloadTask.from_protocol_string('http', 'us-il-champaign', headers={'User-Agent': 'custom-agent/1.0'})
+        self.assertEqual(task.headers['User-Agent'], 'custom-agent/1.0')
+
+class TestURLDownloadTaskHeaders (unittest.TestCase):
+    ''' Confirm that a source's custom headers are sent on both the
+        file-extension pre-flight request and the real download request.
+    '''
+
+    def setUp(self):
+        self.workdir = tempfile.mkdtemp(prefix='testCacheHeaders-')
+        self.seen_referers = []
+
+    def tearDown(self):
+        shutil.rmtree(self.workdir)
+
+    def response_content(self, url, request):
+        scheme, host, path, _, query, _ = urlparse(url.geturl())
+
+        # A query string forces guess_url_file_extension() to make a
+        # sniffing request instead of trusting the URL's extension,
+        # so this URL exercises both the pre-flight and real download.
+        if (host, path, query) == ('headers-test.local', '/addresses.csv', 'download=true'):
+            self.seen_referers.append(request.headers.get('Referer'))
+            return httmock.response(200, b'FAKE,FAKE\n', headers={'Content-Type': 'text/csv'})
+
+        raise NotImplementedError(url.geturl())
+
+    def test_headers_sent_on_preflight_and_download_requests(self):
+        task = URLDownloadTask('us-il-champaign', headers={'Referer': 'https://example.gov/gis/'})
+        with httmock.HTTMock(self.response_content):
+            output_files = task.download(['http://headers-test.local/addresses.csv?download=true'], self.workdir, None)
+
+        self.assertEqual(len(output_files), 1)
+        # One request for the extension-guessing pre-flight, one for the real download.
+        self.assertEqual(self.seen_referers, ['https://example.gov/gis/', 'https://example.gov/gis/'])
+
+class TestCacheRequestSettings (unittest.TestCase):
+    ''' Confirm that openaddr.cache() reads headers from the nested
+        request.headers key in the source config, and that a source with
+        no request settings at all still works.
+    '''
+
+    def setUp(self):
+        self.destdir = tempfile.mkdtemp(prefix='testCacheRequestSettings-')
+        self.seen_referers = []
+
+    def tearDown(self):
+        shutil.rmtree(self.destdir)
+
+    def response_content(self, url, request):
+        scheme, host, path, _, query, _ = urlparse(url.geturl())
+
+        # A query string forces guess_url_file_extension() to make a
+        # sniffing request instead of trusting the URL's extension,
+        # so this URL exercises both the pre-flight and real download.
+        if (host, path, query) == ('request-settings-test.local', '/addresses.csv', 'download=true'):
+            self.seen_referers.append(request.headers.get('Referer'))
+            return httmock.response(200, b'FAKE,FAKE\n', headers={'Content-Type': 'text/csv'})
+
+        raise NotImplementedError(url.geturl())
+
+    def make_source_config(self, layersource_extra):
+        return SourceConfig(dict({
+            "schema": 2,
+            "layers": {
+                "addresses": [dict({
+                    "name": "default",
+                    "protocol": "http",
+                    "data": "http://request-settings-test.local/addresses.csv?download=true",
+                }, **layersource_extra)]
+            }
+        }), "addresses", "default")
+
+    def test_cache_reads_headers_from_request_settings(self):
+        source_config = self.make_source_config({
+            "request": {
+                "headers": {"Referer": "https://example.gov/gis/"}
+            }
+        })
+
+        with httmock.HTTMock(self.response_content):
+            cache_fn(source_config, self.destdir, {})
+
+        self.assertEqual(self.seen_referers, ['https://example.gov/gis/', 'https://example.gov/gis/'])
+
+    def test_cache_without_request_settings_sends_no_referer(self):
+        source_config = self.make_source_config({})
+
+        with httmock.HTTMock(self.response_content):
+            cache_fn(source_config, self.destdir, {})
+
+        self.assertEqual(self.seen_referers, [None, None])

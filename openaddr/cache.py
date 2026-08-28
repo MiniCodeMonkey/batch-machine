@@ -47,6 +47,13 @@ def traverse(item):
     else:
         yield item
 
+def coordinate_is_usable(value):
+    "Test a single coordinate for a finite number; ESRI reports null geometry as the string \"NaN\""
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
 def request(method, url, **kwargs):
     if urlparse(url).scheme == 'ftp':
         if method != 'GET':
@@ -130,22 +137,23 @@ class DownloadTask(object):
 
 
     @classmethod
-    def from_protocol_string(clz, protocol_string, source_prefix=None):
+    def from_protocol_string(clz, protocol_string, source_prefix=None, headers=None):
+        headers = headers or {}
         if protocol_string.lower() == 'http':
-            return URLDownloadTask(source_prefix)
+            return URLDownloadTask(source_prefix, headers=headers)
         elif protocol_string.lower() == 'file':
-            return URLDownloadTask(source_prefix)
+            return URLDownloadTask(source_prefix, headers=headers)
         elif protocol_string.lower() == 'ftp':
-            return URLDownloadTask(source_prefix)
+            return URLDownloadTask(source_prefix, headers=headers)
         elif protocol_string.lower() == 'esri':
-            return EsriRestDownloadTask(source_prefix)
+            return EsriRestDownloadTask(source_prefix, headers=headers)
         else:
             raise KeyError("I don't know how to extract for protocol {}".format(protocol_string))
 
     def download(self, source_urls, workdir, source_config):
         raise NotImplementedError()
 
-def guess_url_file_extension(url):
+def guess_url_file_extension(url, headers=None):
     ''' Get a filename extension for a URL using various hints.
     '''
     scheme, _, path, _, query, _ = urlparse(url)
@@ -172,7 +180,7 @@ def guess_url_file_extension(url):
         # Get a dictionary of headers and a few bytes of content from the URL.
         #
         if scheme in ('http', 'https'):
-            response = request('GET', url, stream=True)
+            response = request('GET', url, headers=headers or {}, stream=True)
             handle, file = mkstemp()
 
             for chunk in response.iter_content(chunk_size=8192):
@@ -256,7 +264,7 @@ class URLDownloadTask(DownloadTask):
             hash = sha1((host + path_base).encode('utf-8'))
             name_base = u'{}-{}'.format(self.source_prefix, hash.hexdigest()[:8])
 
-        path_ext = guess_url_file_extension(url)
+        path_ext = guess_url_file_extension(url, self.headers)
         _L.debug(u'Guessed {}{} for {}'.format(name_base, path_ext, url))
 
         return os.path.join(dir_path, name_base + path_ext)
@@ -391,7 +399,7 @@ class EsriRestDownloadTask(DownloadTask):
                 _L.debug("File exists %s", file_path)
                 continue
 
-            downloader = EsriDumper(source_url, parent_logger=_L, timeout=300)
+            downloader = EsriDumper(source_url, parent_logger=_L, timeout=300, extra_headers=self.headers)
 
             metadata = downloader.get_metadata()
 
@@ -439,8 +447,8 @@ class EsriRestDownloadTask(DownloadTask):
 
                         if not geom:
                             raise TypeError("No geometry parsed")
-                        if any((isinstance(g, float) and math.isnan(g)) for g in traverse(geom)):
-                            raise TypeError("Geometry has NaN coordinates")
+                        if any(not coordinate_is_usable(c) for c in traverse(geom.get('coordinates'))):
+                            raise TypeError("Geometry has non-finite coordinates")
 
                         shp = shape(geom)
                         row[GEOM_FIELDNAME] = shp.wkt

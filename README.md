@@ -63,7 +63,7 @@ Supported layer types are `addresses`, `parcels`, `buildings`, and `centerlines`
 
 Review https://github.com/openaddresses/openaddresses/blob/master/CONTRIBUTING.md for input json syntax.
 
-Supported conform formats include `shapefile`, `geojson`, `csv`, `xml`, `gdb`, and `gpkg`.
+Supported conform formats include `shapefile`, `geojson`, `csv`, `xml`, `gdb`, `gpkg`, and `kml` (2D Point placemarks with simple `ExtendedData` attributes are verified; other geometry types and `Schema`-typed attributes go through the same GDAL driver but are untested; altitude/3D coordinates and KMZ are not supported).
 
 ## Geocodio fork notes
 
@@ -77,3 +77,9 @@ diverge from upstream and must be preserved across upstream merges:
   conformed output row, so named-but-unnumbered properties stay individually
   addressable. It is a geocodio-specific addition and is not part of the
   upstream OpenAddresses schema.
+- **Non-finite geometry is never written out** — ESRI services report a null
+  point geometry as the string `"NaN"`, which reached the output as
+  `"coordinates": [NaN, NaN]`. Invalid GeoJSON per RFC 7946, and unparseable by
+  strict decoders. `openaddr/cache.py` now skips those features on download and
+  `openaddr/conform.py` treats any non-finite WKT coordinate as no geometry,
+  with `allow_nan=False` on the output writer as a backstop.
